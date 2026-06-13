@@ -1,0 +1,63 @@
+[package]
+name = "valkv-blob"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "blob-api"
+path = "src/main.rs"
+
+[dependencies]
+axum = { version = "0.7", features = ["multipart"] }
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.5", features = ["cors", "trace"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sqlx = { version = "0.7", features = ["runtime-tokio-native-tls", "postgres", "uuid", "chrono", "json"] }
+
+# ── AWS SDK — pinned as a coherent set ───────────────────────────────────────
+# These versions are pinned as a coherent set proven to build on rust:1.92.
+# The published aws-runtime 1.7.x only compiles
+# against this smithy generation; letting any aws-smithy-* crate float to the
+# next one (eventstream 0.60.21 / types 1.5.0 / runtime-api 1.12.3) hits
+# E0282 in aws-runtime's sigv4.rs. The crates below that src/ never imports
+# exist ONLY to pin transitive resolution. Bump the whole set together or not
+# at all.
+aws-config    = { version = "=1.8.16", features = ["behavior-version-latest"] }
+aws-sdk-s3    = "=1.131.0"
+# aws-config transitive deps — pin to the same release family as aws-sdk-s3
+aws-sdk-sso   = "=1.98.0"
+aws-sdk-ssooidc = "=1.100.0"
+aws-sdk-sts   = "=1.103.0"
+aws-credential-types = "=1.2.14"
+aws-runtime = "=1.7.3"
+aws-sigv4 = "=1.4.3"
+aws-types = "=1.3.15"
+aws-smithy-async = "=1.2.14"
+aws-smithy-checksums = "=0.64.7"
+aws-smithy-eventstream = "=0.60.20"
+aws-smithy-http = "=0.63.6"
+aws-smithy-http-client = "=1.1.12"
+aws-smithy-json = "=0.62.5"
+aws-smithy-observability = "=0.2.6"
+aws-smithy-query = "=0.60.15"
+aws-smithy-runtime = "=1.11.1"
+aws-smithy-runtime-api = "=1.12.0"
+aws-smithy-types = "=1.4.7"
+aws-smithy-xml = "=0.60.15"
+
+jsonwebtoken = "8"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+anyhow = "1"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+bytes = "1"
+futures = "0.3"
+dotenvy = "0.15"
+mime_guess = "2"
+reqwest = { version = "0.12", default-features = false, features = ["native-tls", "json", "stream"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
