@@ -1,0 +1,82 @@
+name: Release
+
+# Triggers:
+#   1. Push a semver tag (git tag v1.2.3 && git push origin v1.2.3)
+#      → builds and pushes valkv/blob-api:1.2.3, :1.2, :1, :latest
+#   2. workflow_dispatch — manually trigger a release for a specific tag
+#      → same image tags as above
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Git tag to build (e.g. v1.2.3) — must already exist in the repo'
+        required: true
+        type: string
+
+env:
+  IMAGE: valkv/blob-api
+
+jobs:
+  build-and-push:
+    name: Build & push Docker image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Resolve ref
+        id: ref
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "ref=refs/tags/${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "ref=${{ github.ref }}" >> "$GITHUB_OUTPUT"
+            echo "tag=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.ref.outputs.ref }}
+
+      # Build multi-platform images (amd64 for servers, arm64 for Apple Silicon / ARM servers).
+      # Note: Rust cross-compilation via QEMU is slow (~25 min for arm64).
+      # If build time becomes a problem, split into separate native-runner jobs.
+      - name: Set up QEMU (for cross-platform builds)
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # Derives image tags from the git tag:
+      #   v1.2.3  →  valkv/blob-api:1.2.3, :1.2, :1, :latest
+      - name: Extract image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=semver,pattern={{version}},value=${{ steps.ref.outputs.tag }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ steps.ref.outputs.tag }}
+            type=semver,pattern={{major}},value=${{ steps.ref.outputs.tag }}
+            type=raw,value=latest
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

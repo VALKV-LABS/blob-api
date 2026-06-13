@@ -1,0 +1,12 @@
+TUS
+- Add OPTIONS handler to advertise Tus-Extension: creation
+  (strict tus-js-client configs require it; most clients fall back gracefully without it)
+- Swap custom base64 decoder in parse_tus_metadata() for the `base64` crate
+  (current impl has an off-by-one risk on the remainder block)
+
+Storage
+- Add RLS policies on storage.objects
+  (currently application-layer only: service_role vs anon check in routes/objects.rs)
+- S3 object cleanup on project delete
+  (objects under {project_ref}/ in the shared bucket are NOT deleted when a project is deleted;
+  needs a background purge job keyed by prefix before GA)
