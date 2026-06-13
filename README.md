@@ -538,3 +538,40 @@ Dockerfile
 
 Please do not reference internal infrastructure names (MinIO, RocksDB, etc.) in
 user-visible error messages or API responses.
+
+---
+
+## Releasing
+
+Every merge to `main` is automatically tagged with the next minor version and
+published to [Docker Hub](https://hub.docker.com/r/valkv/blob-api). No manual
+tagging required.
+
+**Auto-release flow**
+
+```
+PR merged to main
+  → workflow computes next minor version (v1.0.0 → v1.1.0)
+  → creates the git tag
+  → builds linux/amd64 + linux/arm64 natively (no emulation)
+  → pushes multi-platform image to Docker Hub
+```
+
+| Docker tag | Example |
+|---|---|
+| Full version | `valkv/blob-api:1.1.0` |
+| Minor | `valkv/blob-api:1.1` |
+| Major | `valkv/blob-api:1` |
+| Latest stable | `valkv/blob-api:latest` |
+
+**Manual release** (specific version): Go to Actions → Release → Run workflow →
+enter the tag (e.g. `v1.5.0`). The tag must not already exist.
+
+**To undo a release** (before the workflow completes):
+
+```bash
+git push origin :refs/tags/v1.1.0   # delete remote tag
+```
+
+Note: once pushed to Docker Hub the image cannot be unpublished from the registry,
+only the git tag can be removed.
