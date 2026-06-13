@@ -15,7 +15,7 @@ on:
         type: string
 
 env:
-  IMAGE: valkv/blob-api
+  IMAGE: valkvlabs/blob-api
 
 jobs:
   # ── Compute next version (skip on workflow_dispatch — tag is provided) ────────
@@ -164,5 +164,5 @@ jobs:
           echo "### Released ${{ needs.version.outputs.tag }} :rocket:" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
-          echo "docker pull valkv/blob-api:${{ needs.version.outputs.tag }}" >> $GITHUB_STEP_SUMMARY
+          echo "docker pull valkvlabs/blob-api:${{ needs.version.outputs.tag }}" >> $GITHUB_STEP_SUMMARY
           echo "\`\`\`" >> $GITHUB_STEP_SUMMARY

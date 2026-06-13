@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/VALKV-LABS/blob-api/actions/workflows/ci.yml/badge.svg)](https://github.com/VALKV-LABS/blob-api/actions/workflows/ci.yml)
 [![Release](https://github.com/VALKV-LABS/blob-api/actions/workflows/release.yml/badge.svg)](https://github.com/VALKV-LABS/blob-api/actions/workflows/release.yml)
-[![Docker Hub](https://img.shields.io/docker/v/valkv/blob-api?sort=semver&label=docker&logo=docker)](https://hub.docker.com/r/valkv/blob-api)
+[![Docker Hub](https://img.shields.io/docker/v/valkvlabs/blob-api?sort=semver&label=docker&logo=docker)](https://hub.docker.com/r/valkvlabs/blob-api)
 [![License](https://img.shields.io/github/license/VALKV-LABS/blob-api)](LICENSE)
 
 A self-hosted, Supabase Storage-compatible blob storage service written in Rust.
@@ -544,7 +544,7 @@ user-visible error messages or API responses.
 ## Releasing
 
 Every merge to `main` is automatically tagged with the next minor version and
-published to [Docker Hub](https://hub.docker.com/r/valkv/blob-api). No manual
+published to [Docker Hub](https://hub.docker.com/r/valkvlabs/blob-api). No manual
 tagging required.
 
 **Auto-release flow**
@@ -559,10 +559,10 @@ PR merged to main
 
 | Docker tag | Example |
 |---|---|
-| Full version | `valkv/blob-api:1.1.0` |
-| Minor | `valkv/blob-api:1.1` |
-| Major | `valkv/blob-api:1` |
-| Latest stable | `valkv/blob-api:latest` |
+| Full version | `valkvlabs/blob-api:1.1.0` |
+| Minor | `valkvlabs/blob-api:1.1` |
+| Major | `valkvlabs/blob-api:1` |
+| Latest stable | `valkvlabs/blob-api:latest` |
 
 **Manual release** (specific version): Go to Actions → Release → Run workflow →
 enter the tag (e.g. `v1.5.0`). The tag must not already exist.
