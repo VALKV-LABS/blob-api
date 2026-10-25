@@ -16,6 +16,9 @@ pub struct Config {
     pub storage_quota_bytes: Option<u64>,
     pub signed_url_expiry_secs: u64,
     pub tenant_id: String,
+    /// Create what's missing of the storage schema at startup (db::init_schema).
+    /// false where the schema is managed elsewhere.
+    pub schema_init: bool,
 }
 
 impl Config {
@@ -45,6 +48,9 @@ impl Config {
                 .unwrap_or_else(|_| "120".into())
                 .parse()?,
             tenant_id: env::var("TENANT_ID").unwrap_or_default(),
+            schema_init: !env::var("STORAGE_SCHEMA_INIT")
+                .unwrap_or_default()
+                .eq_ignore_ascii_case("false"),
         })
     }
 }

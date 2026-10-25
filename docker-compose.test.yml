@@ -1,5 +1,6 @@
 services:
   # ── Postgres (integ only — unit tests run cargo test with no DB) ──────────────
+  # Standalone: an empty database, blob-api connected as its owner.
   postgres-test:
     profiles: ["integ"]
     image: postgres:16-alpine
@@ -15,22 +16,54 @@ services:
       timeout: 3s
       retries: 15
 
-  # ── MinIO (integ only) ────────────────────────────────────────────────────────
-  minio-test:
+  # Beside an auth service: supabase/postgres, which already has the auth
+  # schema, the API roles and an older storage schema. blob-api connects as the
+  # non-superuser supabase_storage_admin, as in a Supabase-style stack.
+  postgres-supabase-test:
     profiles: ["integ"]
-    image: minio/minio:RELEASE.2024-01-16T16-07-38Z
+    image: supabase/postgres:15.8.1.060
     environment:
-      MINIO_ROOT_USER: testkey
-      MINIO_ROOT_PASSWORD: testsecret
-    command: server /data --console-address ":9001"
-    ports:
-      - "9000:9000"
-      - "9001:9001"
+      POSTGRES_PASSWORD: test
+      POSTGRES_DB: postgres
     healthcheck:
-      test: ["CMD", "mc", "ready", "local"]
-      interval: 5s
+      # Ready once its init has created auth.users (the server restarts during
+      # init, so pg_isready alone answers too early).
+      test: ["CMD-SHELL", "psql -h 127.0.0.1 -U supabase_admin -d postgres -tAc 'select 1 from auth.users limit 1' >/dev/null"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+
+  # What the rest of a Supabase-style stack would have done:
+  #   - the service roles' passwords (the image sets only postgres' and
+  #     supabase_admin's; Supabase's own setup does this in roles.sql);
+  #   - the test users in auth.users, which the image's storage tables
+  #     reference for `owner`.
+  supabase-seed-test:
+    profiles: ["integ"]
+    image: supabase/postgres:15.8.1.060
+    environment:
+      PGPASSWORD: test
+    entrypoint: ["psql", "-h", "postgres-supabase-test", "-U", "supabase_admin", "-d", "postgres", "-v", "ON_ERROR_STOP=1", "-c",
+                 "alter role supabase_storage_admin with password 'test'", "-c",
+                 "insert into auth.users (id) values ('11111111-0000-0000-0000-000000000001'), ('22222222-0000-0000-0000-000000000002') on conflict do nothing"]
+    depends_on:
+      postgres-supabase-test:
+        condition: service_healthy
+
+  # ── S3 (integ only) ───────────────────────────────────────────────────────────
+  # LocalStack: MinIO no longer publishes images. blob-api creates the bucket.
+  s3-test:
+    profiles: ["integ"]
+    image: localstack/localstack:4
+    environment:
+      SERVICES: s3
+    ports:
+      - "4566:4566"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:4566/_localstack/health"]
+      interval: 3s
       timeout: 5s
-      retries: 10
+      retries: 30
 
   # ── Blob API under test ───────────────────────────────────────────────────────
   blob-api-test:
@@ -38,13 +71,14 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    environment:
+    image: valkvlabs/blob-api:test
+    environment: &blob-env
       DATABASE_URL: postgresql://storage_test:test@postgres-test:5432/storage_test
       PGRST_JWT_SECRET: test-jwt-secret-32bytes-padded-ok
       ANON_KEY: ""
       SERVICE_KEY: ""
       GLOBAL_S3_BUCKET: test-bucket
-      GLOBAL_S3_ENDPOINT: http://minio-test:9000
+      GLOBAL_S3_ENDPOINT: http://s3-test:4566
       GLOBAL_S3_FORCE_PATH_STYLE: "true"
       AWS_DEFAULT_REGION: us-east-1
       AWS_ACCESS_KEY_ID: testkey
@@ -52,7 +86,7 @@ services:
       TENANT_ID: test-tenant
       PORT: "5000"
       RUST_LOG: "valkv_blob=debug"
-    healthcheck:
+    healthcheck: &blob-health
       test: ["CMD-SHELL", "curl -sf http://127.0.0.1:5000/storage/v1/health | grep -q ok"]
       interval: 5s
       timeout: 5s
@@ -60,10 +94,25 @@ services:
     depends_on:
       postgres-test:
         condition: service_healthy
-      minio-test:
+      s3-test:
         condition: service_healthy
 
-  # ── Integration test runner ───────────────────────────────────────────────────
+  # The same build, beside an auth service (postgres-supabase-test above).
+  blob-api-supabase-test:
+    profiles: ["integ"]
+    image: valkvlabs/blob-api:test
+    environment:
+      <<: *blob-env
+      DATABASE_URL: postgresql://supabase_storage_admin:test@postgres-supabase-test:5432/postgres
+      GLOBAL_S3_BUCKET: test-bucket-supabase
+    healthcheck: *blob-health
+    depends_on:
+      supabase-seed-test:
+        condition: service_completed_successfully
+      s3-test:
+        condition: service_healthy
+
+  # ── Integration test runners ──────────────────────────────────────────────────
   blob-integ-tests:
     profiles: ["integ"]
     image: node:20-alpine
@@ -76,6 +125,20 @@ services:
       JWT_SECRET: test-jwt-secret-32bytes-padded-ok
     depends_on:
       blob-api-test:
+        condition: service_healthy
+
+  blob-integ-tests-supabase:
+    profiles: ["integ"]
+    image: node:20-alpine
+    working_dir: /integ
+    volumes:
+      - ./test:/integ
+    command: node blob-integ.js
+    environment:
+      STORAGE_URL: http://blob-api-supabase-test:5000
+      JWT_SECRET: test-jwt-secret-32bytes-padded-ok
+    depends_on:
+      blob-api-supabase-test:
         condition: service_healthy
 
   # ── Unit tests (cargo test — no external services needed) ─────────────────────

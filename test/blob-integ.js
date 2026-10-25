@@ -1,5 +1,5 @@
 'use strict'
-// Blob API integration test — runs against a live blob-api + MinIO + Postgres.
+// Blob API integration test — runs against a live blob-api + S3 + Postgres.
 
 const BASE = process.env.STORAGE_URL || 'http://localhost:5000'
 const JWT_SECRET = process.env.JWT_SECRET || 'test-jwt-secret-32bytes-padded-ok'
