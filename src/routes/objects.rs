@@ -10,7 +10,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::{
-    auth::auth_from_headers,
+    auth::{auth_from_headers, Claims},
     db::{self, Object},
     error::{Result, StorageError},
     routes::AppState,
@@ -127,10 +127,15 @@ async fn stream_object(
 }
 
 // ── Upload (POST = fail-if-exists, PUT = upsert) ──────────────────────────────
+//
+// The row is written first, in a transaction as the caller (begin_as), so the
+// policies decide: a new object is theirs, and an existing one can be replaced
+// only by its owner (or service_role). Then the bytes go to S3, then commit, so
+// a refused write never touches another user's object in S3.
 
 async fn upload_inner(
     state: &AppState,
-    owner: Option<uuid::Uuid>,
+    caller: &Claims,
     content_type: &str,
     bucket_id: &str,
     path: &str,
@@ -165,36 +170,37 @@ async fn upload_inner(
         }
     }
 
-    if !upsert {
-        let existing: Option<(uuid::Uuid,)> =
-            sqlx::query_as("SELECT id FROM storage.objects WHERE bucket_id = $1 AND name = $2")
-                .bind(bucket_id)
-                .bind(path)
-                .fetch_optional(&state.db)
-                .await?;
-        if existing.is_some() {
-            return Err(StorageError::Conflict("The resource already exists".into()));
-        }
-    }
-
+    let owner: Option<uuid::Uuid> = caller.user_id().and_then(|s| s.parse().ok());
     let body_len = body.len();
-    state.s3.put(bucket_id, path, content_type, body).await?;
+    let metadata = json!({ "mimetype": content_type, "size": body_len });
 
-    let (id,): (uuid::Uuid,) = sqlx::query_as(
+    let mut tx = db::begin_as(&state.db, caller).await?;
+    // An upsert keeps the existing owner: replacing an object doesn't take it.
+    let sql = if upsert {
         r#"INSERT INTO storage.objects (bucket_id, name, owner, metadata)
            VALUES ($1, $2, $3, $4)
            ON CONFLICT (bucket_id, name) DO UPDATE
              SET updated_at = now(),
-                 owner = EXCLUDED.owner,
                  metadata = EXCLUDED.metadata
-           RETURNING id"#,
-    )
-    .bind(bucket_id)
-    .bind(path)
-    .bind(owner)
-    .bind(json!({ "mimetype": content_type, "size": body_len }))
-    .fetch_one(&state.db)
-    .await?;
+           RETURNING id"#
+    } else {
+        r#"INSERT INTO storage.objects (bucket_id, name, owner, metadata)
+           VALUES ($1, $2, $3, $4)
+           ON CONFLICT (bucket_id, name) DO NOTHING
+           RETURNING id"#
+    };
+    let row: Option<(uuid::Uuid,)> = sqlx::query_as(sql)
+        .bind(bucket_id)
+        .bind(path)
+        .bind(owner)
+        .bind(metadata)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db::rls_denied)?;
+    let (id,) = row.ok_or_else(|| StorageError::Conflict("The resource already exists".into()))?;
+
+    state.s3.put(bucket_id, path, content_type, body).await?;
+    tx.commit().await?;
 
     Ok(Json(json!({ "Id": id.to_string(), "Key": format!("{}/{}", bucket_id, path) })))
 }
@@ -214,7 +220,7 @@ pub async fn upload(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("application/octet-stream")
         .to_string();
-    upload_inner(&state, claims.user_id().and_then(|s| s.parse().ok()), &ct, &bucket, &path, false, body).await
+    upload_inner(&state, &claims, &ct, &bucket, &path, false, body).await
 }
 
 pub async fn upsert(
@@ -232,7 +238,7 @@ pub async fn upsert(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("application/octet-stream")
         .to_string();
-    upload_inner(&state, claims.user_id().and_then(|s| s.parse().ok()), &ct, &bucket, &path, true, body).await
+    upload_inner(&state, &claims, &ct, &bucket, &path, true, body).await
 }
 
 // ── Signed upload URLs ────────────────────────────────────────────────────────
@@ -254,9 +260,15 @@ pub async fn create_upload_signed_url(
         return Err(StorageError::Unauthorized);
     }
     db::require_bucket(&state.db, &bucket).await?;
+    // Only for a path the caller could upload to themselves: a new object, or
+    // their own. The token then writes as them (upload_via_signed_url).
+    if !db::may_write(&state.db, &claims, &bucket, &path).await? {
+        return Err(StorageError::Forbidden);
+    }
+    let owner = if claims.is_service_role() { None } else { claims.user_id() };
 
     let expiry = body.expires_in.unwrap_or(state.config.signed_url_expiry_secs);
-    let token = signed::create_upload_token(&bucket, &path, expiry, &state.config.jwt_secret)?;
+    let token = signed::create_upload_token(&bucket, &path, expiry, owner, &state.config.jwt_secret)?;
     let url = format!(
         "/storage/v1/object/upload/sign/{}/{}?token={}",
         bucket, path, token
@@ -278,7 +290,7 @@ pub async fn upload_via_signed_url(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Json<Value>> {
-    signed::verify_upload_token(&q.token, &bucket, &path, &state.config.jwt_secret)?;
+    let token = signed::verify_upload_token(&q.token, &bucket, &path, &state.config.jwt_secret)?;
 
     let ct = headers
         .get("content-type")
@@ -286,8 +298,12 @@ pub async fn upload_via_signed_url(
         .unwrap_or("application/octet-stream")
         .to_string();
 
-    // No owner — the token is the auth mechanism; the object is unowned.
-    upload_inner(&state, None, &ct, &bucket, &path, true, body).await
+    // As whoever minted the token: their object, under their policies.
+    let caller = match token.owner.as_deref() {
+        Some(owner) => Claims::authenticated(owner),
+        None => Claims::service(),
+    };
+    upload_inner(&state, &caller, &ct, &bucket, &path, true, body).await
 }
 
 // ── Download ──────────────────────────────────────────────────────────────────
@@ -314,14 +330,7 @@ pub async fn get_object(
     let b = db::require_bucket(&state.db, &bucket).await?;
 
     if !b.public && !claims.is_service_role() {
-        let ok = db::rls_object_exists(
-            &state.db,
-            claims.role(),
-            &claims.to_json_string(),
-            &bucket,
-            &path,
-        )
-        .await?;
+        let ok = db::rls_object_exists(&state.db, &claims, &bucket, &path).await?;
         if !ok {
             return Err(StorageError::Forbidden);
         }
@@ -412,14 +421,7 @@ pub async fn head_object(
     let b = db::require_bucket(&state.db, &bucket).await?;
 
     if !b.public && !claims.is_service_role() {
-        let ok = db::rls_object_exists(
-            &state.db,
-            claims.role(),
-            &claims.to_json_string(),
-            &bucket,
-            &path,
-        )
-        .await?;
+        let ok = db::rls_object_exists(&state.db, &claims, &bucket, &path).await?;
         if !ok {
             return Err(StorageError::Forbidden);
         }
@@ -446,8 +448,12 @@ pub async fn create_signed_url(
     headers: HeaderMap,
     Json(body): Json<SignRequest>,
 ) -> Result<Json<Value>> {
-    auth_from_headers(&headers, &state.config.jwt_secret)?;
+    let claims = auth_from_headers(&headers, &state.config.jwt_secret)?;
     db::require_bucket(&state.db, &bucket).await?;
+    // A signed URL hands out the object, so only to someone who may read it.
+    if !claims.is_service_role() && !db::rls_object_exists(&state.db, &claims, &bucket, &path).await? {
+        return Err(StorageError::Forbidden);
+    }
 
     let expiry = body.expires_in.unwrap_or(state.config.signed_url_expiry_secs);
     let token = signed::create_token(&bucket, &path, expiry, &state.config.jwt_secret)?;
@@ -469,20 +475,24 @@ pub async fn create_multi_signed_urls(
     headers: HeaderMap,
     Json(body): Json<MultiSignRequest>,
 ) -> Result<Json<Value>> {
-    auth_from_headers(&headers, &state.config.jwt_secret)?;
+    let claims = auth_from_headers(&headers, &state.config.jwt_secret)?;
     db::require_bucket(&state.db, &bucket).await?;
 
     let expiry = body.expires_in.unwrap_or(state.config.signed_url_expiry_secs);
-    let results: Vec<Value> = body
-        .paths
-        .iter()
-        .map(|path| {
-            let token = signed::create_token(&bucket, path, expiry, &state.config.jwt_secret)?;
-            let signed_url =
-                format!("/storage/v1/object/sign/{}/{}?token={}", bucket, path, token);
-            Ok(json!({ "path": path, "signedURL": signed_url, "token": token }))
-        })
-        .collect::<Result<_>>()?;
+    let mut results: Vec<Value> = Vec::with_capacity(body.paths.len());
+    for path in &body.paths {
+        // Per path, as for one: only objects the caller may read.
+        if !claims.is_service_role() && !db::rls_object_exists(&state.db, &claims, &bucket, path).await? {
+            results.push(json!({
+                "path": path, "signedURL": null, "token": null,
+                "error": "Either the object does not exist or you do not have access to it",
+            }));
+            continue;
+        }
+        let token = signed::create_token(&bucket, path, expiry, &state.config.jwt_secret)?;
+        let signed_url = format!("/storage/v1/object/sign/{}/{}?token={}", bucket, path, token);
+        results.push(json!({ "path": path, "signedURL": signed_url, "token": token }));
+    }
 
     Ok(Json(json!(results)))
 }
@@ -502,19 +512,24 @@ pub async fn remove(
 
     db::require_bucket(&state.db, &bucket).await?;
 
+    // As the caller: RLS deletes only what they own. Someone else's object is
+    // left alone, and looks the same as a missing one.
+    let mut tx = db::begin_as(&state.db, &claims).await?;
     let deleted = sqlx::query(
         "DELETE FROM storage.objects WHERE bucket_id = $1 AND name = $2 RETURNING id",
     )
     .bind(&bucket)
     .bind(&path)
-    .fetch_optional(&state.db)
-    .await?;
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(db::rls_denied)?;
 
     if deleted.is_none() {
         return Err(StorageError::NotFound);
     }
 
     state.s3.delete(&bucket, &path).await?;
+    tx.commit().await?;
 
     Ok(Json(json!([{ "name": path }])))
 }
@@ -543,14 +558,17 @@ pub async fn bulk_delete(
         return Ok(Json(json!([])));
     }
 
-    let deleted_names = db::bulk_delete_objects(&state.db, &bucket, &body.prefixes).await?;
+    // As the caller: only the objects they own are deleted (and returned).
+    let mut tx = db::begin_as(&state.db, &claims).await?;
+    let deleted_names = db::bulk_delete_objects(&mut tx, &bucket, &body.prefixes).await?;
 
-    // Delete from S3 (best-effort — DB is already updated).
+    // Delete from S3 (best-effort), then commit.
     let pairs: Vec<(String, String)> = deleted_names
         .iter()
         .map(|n| (bucket.clone(), n.clone()))
         .collect();
     let _ = state.s3.delete_many(&pairs).await;
+    tx.commit().await?;
 
     let result: Vec<Value> = deleted_names
         .iter()
@@ -699,8 +717,10 @@ pub async fn list(
     headers: HeaderMap,
     Json(body): Json<ListRequest>,
 ) -> Result<Json<Value>> {
-    auth_from_headers(&headers, &state.config.jwt_secret)?;
+    let claims = auth_from_headers(&headers, &state.config.jwt_secret)?;
     db::require_bucket(&state.db, &bucket).await?;
+    // As the caller: RLS lists only what they may read.
+    let mut tx = db::begin_as(&state.db, &claims).await?;
 
     let prefix = body.prefix.unwrap_or_default();
     let limit = body.limit.unwrap_or(100).min(1000);
@@ -726,7 +746,7 @@ pub async fn list(
         .bind(&pattern)
         .bind(limit)
         .bind(offset)
-        .fetch_all(&state.db)
+        .fetch_all(&mut *tx)
         .await?
     } else {
         sqlx::query_as(&format!(
@@ -740,9 +760,10 @@ pub async fn list(
         .bind(format!("{}%", prefix))
         .bind(limit)
         .bind(offset)
-        .fetch_all(&state.db)
+        .fetch_all(&mut *tx)
         .await?
     };
+    tx.rollback().await?;
 
     Ok(Json(json!(objects)))
 }
@@ -849,14 +870,7 @@ pub async fn render_image_authenticated(
     let b = db::require_bucket(&state.db, &bucket).await?;
 
     if !b.public && !claims.is_service_role() {
-        let ok = db::rls_object_exists(
-            &state.db,
-            claims.role(),
-            &claims.to_json_string(),
-            &bucket,
-            &path,
-        )
-        .await?;
+        let ok = db::rls_object_exists(&state.db, &claims, &bucket, &path).await?;
         if !ok {
             return Err(StorageError::Forbidden);
         }

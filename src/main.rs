@@ -17,7 +17,9 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "valkv_blob=info,tower_http=info".parse().unwrap()),
+                // blob_api: the binary's crate name (the package is valkv-blob),
+                // which is what tracing targets. valkv_blob matched nothing.
+                .unwrap_or_else(|_| "blob_api=info,tower_http=info".parse().unwrap()),
         )
         .init();
 

@@ -110,7 +110,7 @@ export AWS_ACCESS_KEY_ID="testkey"
 export AWS_SECRET_ACCESS_KEY="testsecret"
 export AWS_DEFAULT_REGION="us-east-1"
 export TENANT_ID="local-dev"
-export RUST_LOG="valkv_blob=debug"
+export RUST_LOG="blob_api=debug"
 
 cargo run --bin blob-api
 ```
@@ -294,7 +294,7 @@ from the instance metadata service (IMDS v2) automatically.
 | `IMGPROXY_URL` | — | _(unset)_ | Base URL of an [imgproxy](https://imgproxy.net/) instance, e.g. `http://imgproxy:8080`. When set, requests to `/render/image/…` are proxied through imgproxy for on-the-fly resize, crop, and format conversion. When unset, those routes return the raw object. |
 | `SERVICE_KEY` | — | `""` | Pre-issued service role JWT. Informational only — not enforced by the API itself. |
 | `ANON_KEY` | — | `""` | Pre-issued anon JWT. Informational only. |
-| `RUST_LOG` | — | — | Tracing filter, e.g. `valkv_blob=debug,info`. |
+| `RUST_LOG` | — | `blob_api=info,tower_http=info` | Tracing filter, e.g. `blob_api=debug,info`. The target is the binary, `blob_api`, not the package name. |
 | `STORAGE_SCHEMA_INIT` | — | `true` | `false` skips the startup schema step entirely, for a schema managed elsewhere (migrations you run yourself). |
 
 ### Database schema

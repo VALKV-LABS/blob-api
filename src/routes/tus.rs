@@ -8,8 +8,8 @@ use serde_json::json;
 use uuid::Uuid;
 
 use crate::{
-    auth::auth_from_headers,
-    db::MultipartUpload,
+    auth::{auth_from_headers, Claims},
+    db::{self, MultipartUpload},
     error::{Result, StorageError},
     routes::AppState,
 };
@@ -17,6 +17,29 @@ use crate::{
 const SELECT_ALL: &str =
     "SELECT id, bucket_id, object_name, s3_upload_id, upload_offset, upload_length, content_type, owner, parts \
      FROM storage.multipart_uploads WHERE id = $1";
+
+// An upload belongs to whoever created it (multipart_uploads.owner, None for
+// service_role): only they, or service_role, may see, continue or abort it.
+// Anyone else gets 404, as for an upload that doesn't exist.
+async fn load_for(state: &AppState, id: &str, claims: &Claims) -> Result<MultipartUpload> {
+    let upload: Option<MultipartUpload> =
+        sqlx::query_as(SELECT_ALL).bind(id).fetch_optional(&state.db).await?;
+    let upload = upload.ok_or(StorageError::NotFound)?;
+    let caller: Option<Uuid> = claims.user_id().and_then(|s| s.parse().ok());
+    if claims.is_service_role() || (upload.owner.is_some() && upload.owner == caller) {
+        Ok(upload)
+    } else {
+        Err(StorageError::NotFound)
+    }
+}
+
+/// The claims an upload's object is written with: its creator's.
+fn creator(upload: &MultipartUpload) -> Claims {
+    match upload.owner {
+        Some(owner) => Claims::authenticated(&owner.to_string()),
+        None => Claims::service(),
+    }
+}
 
 // POST /storage/v1/upload/resumable
 pub async fn create(
@@ -56,6 +79,17 @@ pub async fn create(
 
     let b = crate::db::require_bucket(&state.db, &bucket_id).await?;
 
+    // Only to a path the caller could upload to: a new object, or their own.
+    // Checked again, by RLS, when the upload completes.
+    if !db::may_write(&state.db, &claims, &bucket_id, &object_name).await? {
+        return Err(StorageError::Forbidden);
+    }
+    let owner: Option<Uuid> = if claims.is_service_role() {
+        None
+    } else {
+        Some(claims.user_id().and_then(|s| s.parse().ok()).ok_or(StorageError::Unauthorized)?)
+    };
+
     // Per-bucket file size cap
     if let Some(limit) = b.file_size_limit {
         if upload_length as u64 > limit as u64 {
@@ -89,8 +123,8 @@ pub async fn create(
     let upload_id = Uuid::new_v4().to_string();
     sqlx::query(
         "INSERT INTO storage.multipart_uploads \
-         (id, bucket_id, object_name, s3_upload_id, upload_offset, upload_length, content_type) \
-         VALUES ($1, $2, $3, $4, 0, $5, $6)",
+         (id, bucket_id, object_name, s3_upload_id, upload_offset, upload_length, content_type, owner) \
+         VALUES ($1, $2, $3, $4, 0, $5, $6, $7)",
     )
     .bind(&upload_id)
     .bind(&bucket_id)
@@ -98,6 +132,7 @@ pub async fn create(
     .bind(&s3_upload_id)
     .bind(upload_length)
     .bind(&content_type)
+    .bind(owner)
     .execute(&state.db)
     .await?;
 
@@ -116,11 +151,8 @@ pub async fn head(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Response> {
-    auth_from_headers(&headers, &state.config.jwt_secret)?;
-
-    let upload: Option<MultipartUpload> =
-        sqlx::query_as(SELECT_ALL).bind(&id).fetch_optional(&state.db).await?;
-    let upload = upload.ok_or(StorageError::NotFound)?;
+    let claims = auth_from_headers(&headers, &state.config.jwt_secret)?;
+    let upload = load_for(&state, &id, &claims).await?;
 
     let mut resp = Response::new(axum::body::Body::empty());
     *resp.status_mut() = StatusCode::OK;
@@ -148,7 +180,7 @@ pub async fn patch_chunk(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response> {
-    auth_from_headers(&headers, &state.config.jwt_secret)?;
+    let claims = auth_from_headers(&headers, &state.config.jwt_secret)?;
 
     let ct = headers
         .get("content-type")
@@ -166,9 +198,7 @@ pub async fn patch_chunk(
         .and_then(|s| s.parse().ok())
         .ok_or_else(|| StorageError::BadRequest("Missing Upload-Offset header".into()))?;
 
-    let upload: Option<MultipartUpload> =
-        sqlx::query_as(SELECT_ALL).bind(&id).fetch_optional(&state.db).await?;
-    let upload = upload.ok_or(StorageError::NotFound)?;
+    let upload = load_for(&state, &id, &claims).await?;
 
     if client_offset != upload.upload_offset {
         return Err(StorageError::BadRequest(format!(
@@ -223,6 +253,26 @@ pub async fn patch_chunk(
             })
             .collect();
 
+        // The object's row first, as its creator, so RLS decides (as for any
+        // upload) before the parts become the object in S3.
+        let mut tx = db::begin_as(&state.db, &creator(&upload)).await?;
+        let written = sqlx::query(
+            "INSERT INTO storage.objects (bucket_id, name, owner, metadata) VALUES ($1, $2, $3, $4) \
+             ON CONFLICT (bucket_id, name) DO UPDATE SET updated_at = now(), metadata = EXCLUDED.metadata",
+        )
+        .bind(&upload.bucket_id)
+        .bind(&upload.object_name)
+        .bind(upload.owner)
+        .bind(json!({ "mimetype": upload.content_type, "size": new_offset }))
+        .execute(&mut *tx)
+        .await
+        .map_err(db::rls_denied);
+        if let Err(e) = written {
+            let _ = state.s3.abort_multipart(&upload.bucket_id, &upload.object_name, &upload.s3_upload_id).await;
+            let _ = sqlx::query("DELETE FROM storage.multipart_uploads WHERE id = $1").bind(&id).execute(&state.db).await;
+            return Err(e);
+        }
+
         state
             .s3
             .complete_multipart(
@@ -232,16 +282,7 @@ pub async fn patch_chunk(
                 completed_parts,
             )
             .await?;
-
-        sqlx::query(
-            "INSERT INTO storage.objects (bucket_id, name, metadata) VALUES ($1, $2, $3) \
-             ON CONFLICT (bucket_id, name) DO UPDATE SET updated_at = now(), metadata = EXCLUDED.metadata",
-        )
-        .bind(&upload.bucket_id)
-        .bind(&upload.object_name)
-        .bind(json!({ "mimetype": upload.content_type, "size": new_offset }))
-        .execute(&state.db)
-        .await?;
+        tx.commit().await?;
 
         sqlx::query("DELETE FROM storage.multipart_uploads WHERE id = $1")
             .bind(&id)
@@ -265,11 +306,8 @@ pub async fn abort(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Response> {
-    auth_from_headers(&headers, &state.config.jwt_secret)?;
-
-    let upload: Option<MultipartUpload> =
-        sqlx::query_as(SELECT_ALL).bind(&id).fetch_optional(&state.db).await?;
-    let upload = upload.ok_or(StorageError::NotFound)?;
+    let claims = auth_from_headers(&headers, &state.config.jwt_secret)?;
+    let upload = load_for(&state, &id, &claims).await?;
 
     let _ = state
         .s3
@@ -334,7 +372,9 @@ fn base64_decode(input: &str) -> anyhow::Result<Vec<u8>> {
         2 => {
             let a = table[bytes[i] as usize] as u32;
             let b = table[bytes[i + 1] as usize] as u32;
-            out.push(((a << 18) | (b << 12) >> 16) as u8);
+            // Parenthesised: `>>` binds tighter than `|`, which used to shift
+            // only the second term and corrupt the last byte ("text/plai\x02").
+            out.push((((a << 18) | (b << 12)) >> 16) as u8);
         }
         3 => {
             let a = table[bytes[i] as usize] as u32;
@@ -347,4 +387,33 @@ fn base64_decode(input: &str) -> anyhow::Result<Vec<u8>> {
         _ => {}
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn base64_decode_every_remainder_length() {
+        // Encodings ending in a 0-, 3- and 2-character block (after trimming '=').
+        for (encoded, decoded) in [
+            ("dGV4dA==", "text"),          // 1 byte left over
+            ("dGV4dC8=", "text/"),         // 2 bytes left over
+            ("dGV4dC9w", "text/p"),        // none left over
+            ("dGV4dC9wbGFpbg==", "text/plain"),
+            ("YS50eHQ=", "a.txt"),
+        ] {
+            assert_eq!(String::from_utf8(base64_decode(encoded).unwrap()).unwrap(), decoded, "{encoded}");
+        }
+    }
+
+    #[test]
+    fn tus_metadata_values_decode_intact() {
+        let mut h = HeaderMap::new();
+        h.insert("upload-metadata", "bucketName YnVja2V0,objectName YS50eHQ=,contentType dGV4dC9wbGFpbg==".parse().unwrap());
+        let m = parse_tus_metadata(&h);
+        assert_eq!(m["bucketName"], "bucket");
+        assert_eq!(m["objectName"], "a.txt");
+        assert_eq!(m["contentType"], "text/plain");
+    }
 }

@@ -12,6 +12,14 @@ use crate::{
     error::{Result, StorageError},
 };
 
+/// An S3 SDK error: the full cause chain to the log (the SDK's Display is only
+/// the outermost layer, e.g. "failed to construct request"), the short form to
+/// the caller.
+fn s3_err<E: std::error::Error>(e: E) -> StorageError {
+    tracing::error!(err = %aws_smithy_types::error::display::DisplayErrorContext(&e), "s3 error");
+    StorageError::S3(e.to_string())
+}
+
 pub struct S3Client {
     inner: Client,
     bucket: String,
@@ -65,7 +73,7 @@ impl S3Client {
             .body(ByteStream::from(data))
             .send()
             .await
-            .map_err(|e| StorageError::S3(e.to_string()))?;
+            .map_err(s3_err)?;
         Ok(())
     }
 
@@ -108,7 +116,7 @@ impl S3Client {
             .key(self.key(bucket_id, name))
             .send()
             .await
-            .map_err(|e| StorageError::S3(e.to_string()))?;
+            .map_err(s3_err)?;
         Ok(())
     }
 
@@ -132,7 +140,7 @@ impl S3Client {
             let delete = Delete::builder()
                 .set_objects(Some(identifiers))
                 .build()
-                .map_err(|e| StorageError::S3(e.to_string()))?;
+                .map_err(s3_err)?;
 
             self.inner
                 .delete_objects()
@@ -140,7 +148,7 @@ impl S3Client {
                 .delete(delete)
                 .send()
                 .await
-                .map_err(|e| StorageError::S3(e.to_string()))?;
+                .map_err(s3_err)?;
         }
         Ok(())
     }
@@ -165,7 +173,7 @@ impl S3Client {
             .key(dst_key)
             .send()
             .await
-            .map_err(|e| StorageError::S3(e.to_string()))?;
+            .map_err(s3_err)?;
         Ok(())
     }
 
@@ -184,7 +192,7 @@ impl S3Client {
             .content_type(content_type)
             .send()
             .await
-            .map_err(|e| StorageError::S3(e.to_string()))?;
+            .map_err(s3_err)?;
 
         resp.upload_id
             .ok_or_else(|| StorageError::S3("no upload_id".into()))
@@ -207,7 +215,7 @@ impl S3Client {
             .body(ByteStream::from(data))
             .send()
             .await
-            .map_err(|e| StorageError::S3(e.to_string()))?;
+            .map_err(s3_err)?;
 
         resp.e_tag
             .ok_or_else(|| StorageError::S3("no etag".into()))
@@ -242,7 +250,7 @@ impl S3Client {
             )
             .send()
             .await
-            .map_err(|e| StorageError::S3(e.to_string()))?;
+            .map_err(s3_err)?;
         Ok(())
     }
 
@@ -259,7 +267,7 @@ impl S3Client {
             .upload_id(s3_upload_id)
             .send()
             .await
-            .map_err(|e| StorageError::S3(e.to_string()))?;
+            .map_err(s3_err)?;
         Ok(())
     }
 

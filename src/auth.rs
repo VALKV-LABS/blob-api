@@ -28,6 +28,15 @@ impl Claims {
         self.sub.as_deref()
     }
 
+    /// The claims an authenticated user's own token would carry.
+    pub fn authenticated(sub: &str) -> Self {
+        Claims { sub: Some(sub.into()), role: Some("authenticated".into()), exp: None, iat: None, extra: Default::default() }
+    }
+
+    pub fn service() -> Self {
+        Claims { sub: None, role: Some("service_role".into()), exp: None, iat: None, extra: Default::default() }
+    }
+
     pub fn to_json_string(&self) -> String {
         serde_json::to_string(self).unwrap_or_else(|_| "{}".into())
     }
