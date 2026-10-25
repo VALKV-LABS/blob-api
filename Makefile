@@ -9,12 +9,17 @@ unit:
 	docker compose -f docker-compose.test.yml --profile unit run --rm blob-unit-tests
 	docker compose -f docker-compose.test.yml --profile unit down -v 2>/dev/null || true
 
-# ── Integration tests (Rust binary + MinIO + Postgres + Node.js runner) ───────
+# ── Integration tests (Rust binary + S3 + Postgres + Node.js runner) ──────────
+# The suite runs twice: standalone on an empty Postgres, and beside an auth
+# service on supabase/postgres as the non-superuser supabase_storage_admin.
 integ:
 	docker compose -f docker-compose.test.yml --profile integ down -v 2>/dev/null || true
 	docker compose -f docker-compose.test.yml --profile integ build $(BUILD_ARGS) blob-api-test
-	docker compose -f docker-compose.test.yml --profile integ run --rm --no-TTY blob-integ-tests; \
-	docker compose -f docker-compose.test.yml --profile integ down -v 2>/dev/null || true
+	@echo "== standalone (empty Postgres) =="
+	docker compose -f docker-compose.test.yml --profile integ run --rm --no-TTY blob-integ-tests && \
+	echo "== beside an auth service (supabase/postgres, supabase_storage_admin) ==" && \
+	docker compose -f docker-compose.test.yml --profile integ run --rm --no-TTY blob-integ-tests-supabase; \
+	rc=$$?; docker compose -f docker-compose.test.yml --profile integ down -v 2>/dev/null || true; exit $$rc
 
 # ── Tear down all test containers and volumes ─────────────────────────────────
 down:

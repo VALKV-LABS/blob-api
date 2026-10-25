@@ -28,7 +28,11 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("connect to postgres")?;
 
-    db::init_schema(&pool).await.context("init storage schema")?;
+    if config.schema_init {
+        db::init_schema(&pool).await.context("init storage schema")?;
+    } else {
+        tracing::info!("STORAGE_SCHEMA_INIT=false: leaving the storage schema as it is");
+    }
 
     let s3 = std::sync::Arc::new(s3::S3Client::new(&config).await);
     if let Err(e) = s3.ensure_bucket_exists().await {

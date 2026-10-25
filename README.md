@@ -50,20 +50,21 @@ tenants share a single S3 bucket, isolated by key prefix.
 
 ## Running locally
 
-### Option A — Full Docker Compose (MinIO + Postgres, zero config)
+### Option A — Full Docker Compose (S3 + Postgres, zero config)
 
 ```bash
 cd blob-api
-make integ          # spins up postgres + minio + the API + runs the test suite
+make integ          # spins up Postgres + S3 (LocalStack) + the API and runs the suite twice:
+                    # standalone, and beside an auth service on supabase/postgres
 make down           # tear everything down
 ```
 
-### Option B — Local binary against MinIO
+### Option B — Local binary against a local S3
 
-Start Postgres and MinIO manually (or reuse the test compose):
+Start Postgres and S3 (LocalStack) manually (or reuse the test compose):
 
 ```bash
-docker compose -f docker-compose.test.yml --profile integ up -d postgres-test minio-test
+docker compose -f docker-compose.test.yml --profile integ up -d postgres-test s3-test
 ```
 
 Then run the binary with env vars:
@@ -72,10 +73,10 @@ Then run the binary with env vars:
 export DATABASE_URL="postgresql://storage_test:test@localhost:5432/storage_test"
 export PGRST_JWT_SECRET="your-jwt-secret-at-least-32-bytes"
 export GLOBAL_S3_BUCKET="my-bucket"
-export GLOBAL_S3_ENDPOINT="http://localhost:9000"
+export GLOBAL_S3_ENDPOINT="http://localhost:4566"
 export GLOBAL_S3_FORCE_PATH_STYLE="true"
-export AWS_ACCESS_KEY_ID="minioadmin"
-export AWS_SECRET_ACCESS_KEY="minioadmin"
+export AWS_ACCESS_KEY_ID="testkey"
+export AWS_SECRET_ACCESS_KEY="testsecret"
 export AWS_DEFAULT_REGION="us-east-1"
 export TENANT_ID="local-dev"
 
@@ -91,11 +92,11 @@ an external auth service at request time. You can mint tokens yourself and hit t
 
 ```bash
 cd blob-api
-docker compose -f docker-compose.test.yml --profile integ up -d postgres-test minio-test
+docker compose -f docker-compose.test.yml --profile integ up -d postgres-test s3-test
 ```
 
-Postgres is on `localhost:5432`, MinIO API on `localhost:9000`, MinIO console
-on `http://localhost:9001` (login: `testkey` / `testsecret`).
+Postgres is on `localhost:5432`, S3 (LocalStack) on `localhost:4566`
+(any access key works; the test compose uses `testkey` / `testsecret`).
 
 **2. Run the API**
 
@@ -103,7 +104,7 @@ on `http://localhost:9001` (login: `testkey` / `testsecret`).
 export DATABASE_URL="postgresql://storage_test:test@localhost:5432/storage_test"
 export PGRST_JWT_SECRET="test-jwt-secret-32bytes-padded-ok"
 export GLOBAL_S3_BUCKET="test-bucket"
-export GLOBAL_S3_ENDPOINT="http://localhost:9000"
+export GLOBAL_S3_ENDPOINT="http://localhost:4566"
 export GLOBAL_S3_FORCE_PATH_STYLE="true"
 export AWS_ACCESS_KEY_ID="testkey"
 export AWS_SECRET_ACCESS_KEY="testsecret"
@@ -114,7 +115,7 @@ export RUST_LOG="valkv_blob=debug"
 cargo run --bin blob-api
 ```
 
-The schema is created automatically on startup. You should see
+Whatever is missing of the schema is created on startup. You should see
 `blob-api listening on 0.0.0.0:5000`.
 
 **3. Mint a JWT**
@@ -275,7 +276,7 @@ from the instance metadata service (IMDS v2) automatically.
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `DATABASE_URL` | ✅ | — | PostgreSQL connection string. Schema is auto-created on startup. |
+| `DATABASE_URL` | ✅ | — | PostgreSQL connection string. Whatever is missing of the schema is created on startup (see [Database schema](#database-schema)). |
 | `PGRST_JWT_SECRET` | ✅ | — | HS256 secret used to verify client JWTs. Also accepted as `JWT_SECRET`. Must be ≥ 32 bytes. |
 | `GLOBAL_S3_BUCKET` | ✅ | — | Name of the S3 bucket that holds all object data. |
 | `AWS_DEFAULT_REGION` | — | `us-east-1` | AWS region for the S3 bucket. |
@@ -294,6 +295,25 @@ from the instance metadata service (IMDS v2) automatically.
 | `SERVICE_KEY` | — | `""` | Pre-issued service role JWT. Informational only — not enforced by the API itself. |
 | `ANON_KEY` | — | `""` | Pre-issued anon JWT. Informational only. |
 | `RUST_LOG` | — | — | Tracing filter, e.g. `valkv_blob=debug,info`. |
+| `STORAGE_SCHEMA_INIT` | — | `true` | `false` skips the startup schema step entirely, for a schema managed elsewhere (migrations you run yourself). |
+
+### Database schema
+
+At startup the service creates whatever is missing of what it needs: the
+`storage` schema, its tables and columns, the `(bucket_id, name)` unique index,
+the `anon` / `authenticated` / `service_role` roles, grants and RLS policies.
+Every step checks first and never replaces an existing object, so it runs:
+
+- **Standalone**, on an empty database, as its owner. It also creates the `auth`
+  schema with `auth.uid()`, `auth.role()` and `auth.jwt()`.
+- **Beside an auth service** that already owns `auth` and the roles (e.g.
+  GoTrue on `supabase/postgres`), as a non-superuser that owns the storage
+  tables — `supabase_storage_admin` there. It leaves `auth` alone (its RLS
+  policies read the caller from the request's claims, not through
+  `auth.uid()`), and adds any column an older `storage.buckets` lacks.
+
+The connecting role must be able to `SET ROLE` to `anon`, `authenticated` and
+`service_role` (on supabase/postgres it can, through `authenticator`).
 
 ---
 
@@ -495,7 +515,7 @@ download endpoint, and vice versa.
 
 ```bash
 make unit            # run Rust unit tests inside Docker (no external services)
-make integ           # run integration tests (Postgres + MinIO + the API)
+make integ           # run integration tests (Postgres + S3 + the API), standalone and beside an auth service
 make unit NO_CACHE=1 # rebuild Docker image from scratch (clears cargo cache)
 make down            # stop and remove all test containers and volumes
 ```
