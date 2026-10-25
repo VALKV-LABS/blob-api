@@ -13,6 +13,10 @@ pub struct SignedUrlClaims {
     /// this field was added.
     #[serde(default = "default_download")]
     pub kind: String,
+    /// Upload tokens: the user who minted it, who owns the object it writes.
+    /// Absent when service_role minted it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
 }
 
 fn default_download() -> String {
@@ -33,6 +37,7 @@ pub fn create_token(
         exp: now + expires_in_secs,
         iat: now,
         kind: "download".into(),
+        owner: None,
     };
     encode(
         &Header::new(Algorithm::HS256),
@@ -64,6 +69,7 @@ pub fn create_upload_token(
     bucket_id: &str,
     object_name: &str,
     expires_in_secs: u64,
+    owner: Option<&str>,
     secret: &str,
 ) -> Result<String> {
     let now = unix_now();
@@ -72,6 +78,7 @@ pub fn create_upload_token(
         exp: now + expires_in_secs,
         iat: now,
         kind: "upload".into(),
+        owner: owner.map(Into::into),
     };
     encode(
         &Header::new(Algorithm::HS256),
@@ -136,14 +143,15 @@ mod tests {
 
     #[test]
     fn upload_roundtrip() {
-        let tok = create_upload_token("b", "obj.bin", 120, SECRET).unwrap();
+        let tok = create_upload_token("b", "obj.bin", 120, Some("user-1"), SECRET).unwrap();
         let c = verify_upload_token(&tok, "b", "obj.bin", SECRET).unwrap();
         assert_eq!(c.kind, "upload");
+        assert_eq!(c.owner.as_deref(), Some("user-1"));
     }
 
     #[test]
     fn upload_token_rejected_as_download() {
-        let tok = create_upload_token("b", "f.txt", 120, SECRET).unwrap();
+        let tok = create_upload_token("b", "f.txt", 120, None, SECRET).unwrap();
         assert!(verify_token(&tok, "b", "f.txt", SECRET).is_err());
     }
 
@@ -172,6 +180,7 @@ mod tests {
             exp: 1,
             iat: 0,
             kind: "download".into(),
+            owner: None,
         };
         let tok = jsonwebtoken::encode(
             &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),

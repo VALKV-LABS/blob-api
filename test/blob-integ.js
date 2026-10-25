@@ -901,4 +901,140 @@ step('lifecycle rule on missing bucket returns 404', async () => {
   assert(status === 404, `want 404 got ${status}`)
 })
 
+// ── Isolation between users ───────────────────────────────────────────────────
+// One end user must never change, remove, list or hand out another's objects.
+// User A owns the objects below; user B (and anon) try every way in.
+
+const hdr = (token, ct) => ({ Authorization: `Bearer ${token}`, ...(ct ? { 'Content-Type': ct } : {}) })
+const readAs = async (token, path) => {
+  const res = await api('GET', `/storage/v1/object/${path}`, { headers: hdr(token), raw: true })
+  return { status: res.status, text: res.status === 200 ? await res.text() : '' }
+}
+const aStillHas = async (path, text) => {
+  const r = await readAs(userAToken, path)
+  assert(r.status === 200 && r.text === text, `A's ${path} changed: ${r.status} ${JSON.stringify(r.text)}`)
+}
+
+step('isolation: setup — private and public buckets, A uploads to each', async () => {
+  for (const [id, pub] of [['iso-private', false], ['iso-public', true]]) {
+    const { status } = await api('POST', '/storage/v1/bucket', { headers: svcHdr(true), body: { id, name: id, public: pub } })
+    assert(status === 200, `create ${id}: ${status}`)
+  }
+  for (const path of ['iso-private/a.txt', 'iso-public/p.txt']) {
+    const { status, data } = await api('POST', `/storage/v1/object/${path}`, { headers: hdr(userAToken, 'text/plain'), body: `A's ${path}` })
+    assert(status === 200, `A upload ${path}: ${status} ${JSON.stringify(data)}`)
+  }
+  await aStillHas('iso-private/a.txt', "A's iso-private/a.txt")
+})
+
+step('isolation: B cannot read A\'s private object', async () => {
+  const r = await readAs(userBToken, 'iso-private/a.txt')
+  assert(r.status === 403, `want 403 got ${r.status}`)
+})
+
+step('isolation: B cannot overwrite A\'s object (POST 409, PUT 403), bytes untouched', async () => {
+  const post = await api('POST', '/storage/v1/object/iso-private/a.txt', { headers: hdr(userBToken, 'text/plain'), body: 'B was here' })
+  assert(post.status === 409, `POST want 409 got ${post.status}`)
+  const put = await api('PUT', '/storage/v1/object/iso-private/a.txt', { headers: hdr(userBToken, 'text/plain'), body: 'B was here' })
+  assert(put.status === 403, `PUT want 403 got ${put.status}`)
+  const pubPut = await api('PUT', '/storage/v1/object/iso-public/p.txt', { headers: hdr(userBToken, 'text/plain'), body: 'B was here' })
+  assert(pubPut.status === 403, `PUT on a public bucket want 403 got ${pubPut.status}`)
+  await aStillHas('iso-private/a.txt', "A's iso-private/a.txt")
+  await aStillHas('iso-public/p.txt', "A's iso-public/p.txt")
+})
+
+step('isolation: B cannot delete A\'s object, singly or in bulk', async () => {
+  const one = await api('DELETE', '/storage/v1/object/iso-private/a.txt', { headers: hdr(userBToken) })
+  assert(one.status === 404, `DELETE want 404 got ${one.status}`)
+  const pub = await api('DELETE', '/storage/v1/object/iso-public/p.txt', { headers: hdr(userBToken) })
+  assert(pub.status === 404, `DELETE on a public bucket want 404 got ${pub.status}`)
+  const bulk = await api('DELETE', '/storage/v1/object/iso-private', { headers: hdr(userBToken, 'application/json'), body: { prefixes: ['a.txt'] } })
+  assert(bulk.status === 200 && Array.isArray(bulk.data) && bulk.data.length === 0, `bulk want [] got ${bulk.status} ${JSON.stringify(bulk.data)}`)
+  await aStillHas('iso-private/a.txt', "A's iso-private/a.txt")
+  await aStillHas('iso-public/p.txt', "A's iso-public/p.txt")
+})
+
+step('isolation: listing a private bucket shows B nothing of A\'s, and A their own', async () => {
+  const b = await api('POST', '/storage/v1/object/list/iso-private', { headers: hdr(userBToken, 'application/json'), body: { prefix: '' } })
+  assert(b.status === 200 && b.data.length === 0, `B sees ${JSON.stringify(b.data)}`)
+  const a = await api('POST', '/storage/v1/object/list/iso-private', { headers: hdr(userAToken, 'application/json'), body: { prefix: '' } })
+  assert(a.status === 200 && a.data.some(o => o.name === 'a.txt'), `A sees ${JSON.stringify(a.data)}`)
+  const anon = await api('POST', '/storage/v1/object/list/iso-private', { headers: hdr(anonToken, 'application/json'), body: { prefix: '' } })
+  assert(anon.status === 200 && anon.data.length === 0, `anon sees ${JSON.stringify(anon.data)}`)
+})
+
+step('isolation: no signed download URL for an object the caller cannot read', async () => {
+  const b = await api('POST', '/storage/v1/object/sign/iso-private/a.txt', { headers: hdr(userBToken, 'application/json'), body: { expires_in: 60 } })
+  assert(b.status === 403, `B want 403 got ${b.status}`)
+  const anon = await api('POST', '/storage/v1/object/sign/iso-private/a.txt', { headers: { 'Content-Type': 'application/json' }, body: { expires_in: 60 } })
+  assert(anon.status === 403, `no token want 403 got ${anon.status}`)
+  const multi = await api('POST', '/storage/v1/object/sign/iso-private', { headers: hdr(userBToken, 'application/json'), body: { paths: ['a.txt'], expires_in: 60 } })
+  assert(multi.status === 200 && multi.data[0].signedURL === null && multi.data[0].error, `multi gave B ${JSON.stringify(multi.data)}`)
+  const a = await api('POST', '/storage/v1/object/sign/iso-private/a.txt', { headers: hdr(userAToken, 'application/json'), body: { expires_in: 60 } })
+  assert(a.status === 200 && a.data.signedURL, `A want a URL got ${a.status}`)
+  const res = await fetch(`${BASE}${a.data.signedURL}`)
+  assert(res.status === 200 && await res.text() === "A's iso-private/a.txt", `A's signed URL: ${res.status}`)
+})
+
+step('isolation: signed upload URLs — none for A\'s path to B; A\'s writes as A', async () => {
+  const b = await api('POST', '/storage/v1/object/upload/sign/iso-private/a.txt', { headers: hdr(userBToken, 'application/json'), body: { expires_in: 60 } })
+  assert(b.status === 403, `B want 403 got ${b.status}`)
+  const a = await api('POST', '/storage/v1/object/upload/sign/iso-private/a-signed.txt', { headers: hdr(userAToken, 'application/json'), body: { expires_in: 60 } })
+  assert(a.status === 200, `A want 200 got ${a.status}`)
+  const up = await fetch(`${BASE}${a.data.url}`, { method: 'PUT', headers: { 'Content-Type': 'text/plain' }, body: 'via signed URL' })
+  assert(up.status === 200, `upload via A's URL: ${up.status}`)
+  await aStillHas('iso-private/a-signed.txt', 'via signed URL')
+  const r = await readAs(userBToken, 'iso-private/a-signed.txt')
+  assert(r.status === 403, `the object is A's, B want 403 got ${r.status}`)
+})
+
+const tusMeta = (bucket, name) =>
+  [['bucketName', bucket], ['objectName', name], ['contentType', 'text/plain']]
+    .map(([k, v]) => `${k} ${Buffer.from(v).toString('base64')}`).join(',')
+const tusCreate = (token, bucket, name, length) =>
+  fetch(`${BASE}/storage/v1/upload/resumable`, {
+    method: 'POST',
+    headers: { ...hdr(token), 'Tus-Resumable': '1.0.0', 'Upload-Length': String(length), 'Upload-Metadata': tusMeta(bucket, name) },
+  })
+const tusPatch = (token, location, offset, body) =>
+  fetch(`${BASE}${location}`, {
+    method: 'PATCH',
+    headers: { ...hdr(token), 'Tus-Resumable': '1.0.0', 'Content-Type': 'application/offset+octet-stream', 'Upload-Offset': String(offset) },
+    body,
+  })
+
+step('isolation: B cannot start a resumable upload onto A\'s object', async () => {
+  const res = await tusCreate(userBToken, 'iso-private', 'a.txt', 10)
+  assert(res.status === 403, `want 403 got ${res.status}`)
+  await aStillHas('iso-private/a.txt', "A's iso-private/a.txt")
+})
+
+step('isolation: A\'s resumable upload is A\'s alone, and makes A\'s object', async () => {
+  const body = "A's resumable upload"
+  const created = await tusCreate(userAToken, 'iso-private', 'a-tus.txt', body.length)
+  assert(created.status === 201, `create want 201 got ${created.status}`)
+  const location = created.headers.get('location')
+  const head = await fetch(`${BASE}${location}`, { method: 'HEAD', headers: { ...hdr(userBToken), 'Tus-Resumable': '1.0.0' } })
+  assert(head.status === 404, `B HEAD want 404 got ${head.status}`)
+  const bPatch = await tusPatch(userBToken, location, 0, 'B was here')
+  assert(bPatch.status === 404, `B PATCH want 404 got ${bPatch.status}`)
+  const bAbort = await fetch(`${BASE}${location}`, { method: 'DELETE', headers: { ...hdr(userBToken), 'Tus-Resumable': '1.0.0' } })
+  assert(bAbort.status === 404, `B DELETE want 404 got ${bAbort.status}`)
+  const aPatch = await tusPatch(userAToken, location, 0, body)
+  assert(aPatch.status === 204, `A PATCH want 204 got ${aPatch.status}`)
+  await aStillHas('iso-private/a-tus.txt', body)
+  const r = await readAs(userBToken, 'iso-private/a-tus.txt')
+  assert(r.status === 403, `B want 403 got ${r.status}`)
+})
+
+step('isolation: A can replace and delete their own objects', async () => {
+  const put = await api('PUT', '/storage/v1/object/iso-private/a.txt', { headers: hdr(userAToken, 'text/plain'), body: 'A replaced it' })
+  assert(put.status === 200, `A PUT want 200 got ${put.status}`)
+  await aStillHas('iso-private/a.txt', 'A replaced it')
+  for (const path of ['iso-private/a.txt', 'iso-private/a-signed.txt', 'iso-private/a-tus.txt', 'iso-public/p.txt']) {
+    const del = await api('DELETE', `/storage/v1/object/${path}`, { headers: hdr(userAToken) })
+    assert(del.status === 200, `A DELETE ${path} want 200 got ${del.status}`)
+  }
+})
+
 run().catch(e => { console.error(e); process.exit(1) })

@@ -1,9 +1,10 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
+use crate::auth::Claims;
 use crate::error::{Result, StorageError};
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
@@ -356,14 +357,16 @@ pub async fn get_object_metadata(pool: &PgPool, bucket_id: &str, name: &str) -> 
 }
 
 // Delete objects by exact name list; returns names that were actually deleted.
-pub async fn bulk_delete_objects(pool: &PgPool, bucket_id: &str, names: &[String]) -> Result<Vec<String>> {
+// Run it on a caller's transaction (begin_as): RLS leaves out what they may not delete.
+pub async fn bulk_delete_objects(conn: &mut PgConnection, bucket_id: &str, names: &[String]) -> Result<Vec<String>> {
     let rows: Vec<(String,)> = sqlx::query_as(
         "DELETE FROM storage.objects WHERE bucket_id = $1 AND name = ANY($2) RETURNING name",
     )
     .bind(bucket_id)
     .bind(names)
-    .fetch_all(pool)
-    .await?;
+    .fetch_all(conn)
+    .await
+    .map_err(rls_denied)?;
     Ok(rows.into_iter().map(|(n,)| n).collect())
 }
 
@@ -411,33 +414,54 @@ pub async fn used_storage_bytes(pool: &PgPool) -> Result<i64> {
     Ok(total)
 }
 
-// ── Object RLS check ─────────────────────────────────────────────────────────
+// ── Running as the caller ────────────────────────────────────────────────────
+//
+// The service connects as the owner of the storage tables, and a table's owner
+// bypasses its row level security. So every query on storage.objects made for
+// an anon or authenticated caller runs in a transaction switched to that
+// caller's role, with their claims set: the policies in init_schema (own
+// objects, or public buckets) then decide what they can see, write and delete.
+// service_role stays on the owner, which is what "bypasses RLS" means for it.
 
 fn pg_role_or_anon(role: &str) -> &'static str {
     match role {
-        "service_role" => "service_role",
         "authenticated" => "authenticated",
         _ => "anon",
     }
 }
 
+/// A transaction that runs as `claims`' database role, with their claims set.
+pub async fn begin_as(pool: &PgPool, claims: &Claims) -> Result<Transaction<'static, Postgres>> {
+    let mut tx = pool.begin().await?;
+    if !claims.is_service_role() {
+        sqlx::query("SELECT set_config('role', $1, true)")
+            .bind(pg_role_or_anon(claims.role()))
+            .execute(&mut *tx)
+            .await?;
+    }
+    sqlx::query("SELECT set_config('request.jwt.claims', $1, true)")
+        .bind(claims.to_json_string())
+        .execute(&mut *tx)
+        .await?;
+    Ok(tx)
+}
+
+/// A row level security refusal (or missing privilege) is the caller's: 403.
+pub fn rls_denied(e: sqlx::Error) -> StorageError {
+    match e.as_database_error().and_then(|d| d.code()) {
+        Some(code) if code == "42501" => StorageError::Forbidden,
+        _ => StorageError::Db(e),
+    }
+}
+
+/// Whether `claims` may read the object (it exists and the policies let them see it).
 pub async fn rls_object_exists(
     pool: &PgPool,
-    pg_role: &str,
-    claims_json: &str,
+    claims: &Claims,
     bucket_id: &str,
     object_name: &str,
 ) -> Result<bool> {
-    let safe_role = pg_role_or_anon(pg_role);
-    let mut tx = pool.begin().await?;
-    sqlx::query("SELECT set_config('role', $1, true)")
-        .bind(safe_role)
-        .execute(&mut *tx)
-        .await?;
-    sqlx::query("SELECT set_config('request.jwt.claims', $1, true)")
-        .bind(claims_json)
-        .execute(&mut *tx)
-        .await?;
+    let mut tx = begin_as(pool, claims).await?;
     let row: Option<(Uuid,)> = sqlx::query_as(
         "SELECT id FROM storage.objects WHERE bucket_id = $1 AND name = $2",
     )
@@ -447,6 +471,32 @@ pub async fn rls_object_exists(
     .await?;
     tx.rollback().await?;
     Ok(row.is_some())
+}
+
+/// The owner of an existing object, if there is one; None when there's no
+/// object. Read on the service's own connection, so it sees every row.
+pub async fn existing_owner(pool: &PgPool, bucket_id: &str, object_name: &str) -> Result<Option<Option<Uuid>>> {
+    let row: Option<(Option<Uuid>,)> =
+        sqlx::query_as("SELECT owner FROM storage.objects WHERE bucket_id = $1 AND name = $2")
+            .bind(bucket_id)
+            .bind(object_name)
+            .fetch_optional(pool)
+            .await?;
+    Ok(row.map(|(o,)| o))
+}
+
+/// Whether `claims` may write `object_name`: service_role always; anyone else
+/// only a new object, or one they own. Writes are checked again by RLS; this
+/// is for refusing before any bytes move (signed upload URLs, resumable uploads).
+pub async fn may_write(pool: &PgPool, claims: &Claims, bucket_id: &str, object_name: &str) -> Result<bool> {
+    if claims.is_service_role() {
+        return Ok(true);
+    }
+    let caller: Option<Uuid> = claims.user_id().and_then(|s| s.parse().ok());
+    Ok(match existing_owner(pool, bucket_id, object_name).await? {
+        None => caller.is_some(),
+        Some(owner) => owner.is_some() && owner == caller,
+    })
 }
 
 // ── Lifecycle rules ───────────────────────────────────────────────────────────

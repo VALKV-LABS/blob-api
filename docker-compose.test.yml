@@ -85,7 +85,7 @@ services:
       AWS_SECRET_ACCESS_KEY: testsecret
       TENANT_ID: test-tenant
       PORT: "5000"
-      RUST_LOG: "valkv_blob=debug"
+      RUST_LOG: "blob_api=debug"
     healthcheck: &blob-health
       test: ["CMD-SHELL", "curl -sf http://127.0.0.1:5000/storage/v1/health | grep -q ok"]
       interval: 5s
